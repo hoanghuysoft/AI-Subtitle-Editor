@@ -26,7 +26,9 @@ import {
   Globe,
   Cpu,
   Key,
-  Sparkles
+  Sparkles,
+  Undo,
+  Redo
 } from "lucide-react";
 
 const TRIAL_SRT = `1
@@ -52,6 +54,12 @@ Go, get out of there, you crazy magnificent bastard!`;
 export default function App() {
   const [fileName, setFileName] = useState<string>("");
   const [blocks, setBlocks] = useState<SubtitleBlock[]>([]);
+
+  // History state vectors for Undo/Redo protocols
+  const [past, setPast] = useState<{ blocks: SubtitleBlock[]; fileName: string }[]>([]);
+  const [future, setFuture] = useState<{ blocks: SubtitleBlock[]; fileName: string }[]>([]);
+  const lastHistoryPushTimeRef = useRef<number>(0);
+
   const [service, setService] = useState<string>("gemini");
   const [sourceLanguage, setSourceLanguage] = useState<string>(() => localStorage.getItem("srt_source_language") || "Auto-Detect");
   const [targetLanguage, setTargetLanguage] = useState<string>(() => localStorage.getItem("srt_target_language") || "Japanese");
@@ -90,6 +98,7 @@ export default function App() {
       if (parsed.length === 0) {
         throw new Error("Could not find any valid subtitle frames in the SRT file.");
       }
+      handleForcePushToHistory();
       setBlocks(parsed);
       setFileName(name);
       setGlobalError(null);
@@ -105,6 +114,7 @@ export default function App() {
 
   // Handle manual translation edit
   const handleBlockTextUpdate = (id: number, text: string) => {
+    pushToHistory({ blocks: blocksRef.current, fileName: fileNameRef.current }, false);
     setBlocks((prev) =>
       prev.map((b) => (b.id === id ? { ...b, translatedText: text, status: "done" } : b))
     );
@@ -162,6 +172,9 @@ export default function App() {
 
       const data = await response.json();
       const translations: { id: number; text: string }[] = data.translations || [];
+
+      // Save state before batch updates
+      handleForcePushToHistory();
 
       // Update blocks with matching translations
       setBlocks((prev) => {
@@ -222,10 +235,132 @@ export default function App() {
     cancellationRef.current = true;
   };
 
+  // Synchronize state values to refs for the keydown handler to prevent stale closures
+  const pastRef = useRef(past);
+  const futureRef = useRef(future);
+  const blocksRef = useRef(blocks);
+  const fileNameRef = useRef(fileName);
+  const isTranslatingRef = useRef(isTranslating);
+
+  useEffect(() => {
+    pastRef.current = past;
+    futureRef.current = future;
+    blocksRef.current = blocks;
+    fileNameRef.current = fileName;
+    isTranslatingRef.current = isTranslating;
+  }, [past, future, blocks, fileName, isTranslating]);
+
+  const pushToHistory = (newPastState: { blocks: SubtitleBlock[]; fileName: string }, force: boolean = false) => {
+    const now = Date.now();
+    setPast((prev) => {
+      if (prev.length > 0) {
+        const last = prev[prev.length - 1];
+        const isSame = JSON.stringify(last.blocks) === JSON.stringify(newPastState.blocks) && last.fileName === newPastState.fileName;
+        if (isSame) {
+          return prev;
+        }
+      }
+      
+      // Prevent keystroke flood unless force-pushed
+      if (!force && (now - lastHistoryPushTimeRef.current < 1500)) {
+        return prev;
+      }
+      
+      lastHistoryPushTimeRef.current = now;
+      const updated = [...prev, newPastState];
+      if (updated.length > 50) {
+        updated.shift();
+      }
+      return updated;
+    });
+    setFuture([]);
+  };
+
+  const handleForcePushToHistory = () => {
+    pushToHistory({ blocks: blocksRef.current, fileName: fileNameRef.current }, true);
+  };
+
+  const handleUndo = () => {
+    const p = pastRef.current;
+    if (p.length === 0) return;
+    
+    const curBlocks = blocksRef.current;
+    const curFileName = fileNameRef.current;
+    
+    const previous = p[p.length - 1];
+    const newPast = p.slice(0, p.length - 1);
+    
+    setFuture((prev) => [{ blocks: curBlocks, fileName: curFileName }, ...prev]);
+    setPast(newPast);
+    
+    if (isTranslatingRef.current) {
+      handlePause();
+    }
+    
+    setBlocks(previous.blocks);
+    setFileName(previous.fileName);
+  };
+
+  const handleRedo = () => {
+    const f = futureRef.current;
+    if (f.length === 0) return;
+    
+    const curBlocks = blocksRef.current;
+    const curFileName = fileNameRef.current;
+    
+    const next = f[0];
+    const newFuture = f.slice(1);
+    
+    setPast((prev) => [...prev, { blocks: curBlocks, fileName: curFileName }]);
+    setFuture(newFuture);
+    
+    if (isTranslatingRef.current) {
+      handlePause();
+    }
+    
+    setBlocks(next.blocks);
+    setFileName(next.fileName);
+  };
+
+  // Keyboard binding for global Ctrl+Z / Ctrl+Y / Cmd+Z / Cmd+Shift+Z / Cmd+Y shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const activeElement = document.activeElement;
+      // Skip history shortcuts if focusing on global API setting entries so they can type normally
+      if (activeElement && activeElement.tagName === "INPUT" && activeElement.id !== "search-input") {
+        return;
+      }
+
+      const isZ = e.key.toLowerCase() === "z";
+      const isY = e.key.toLowerCase() === "y";
+      const isMetaOrCtrl = e.metaKey || e.ctrlKey;
+      
+      if (isMetaOrCtrl) {
+        if (isZ) {
+          e.preventDefault();
+          if (e.shiftKey) {
+            handleRedo();
+          } else {
+            handleUndo();
+          }
+        } else if (isY) {
+          e.preventDefault();
+          handleRedo();
+        }
+      }
+    };
+    
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
   // Reset all
   const handleReset = () => {
     setIsTranslating(false);
     cancellationRef.current = true;
+    handleForcePushToHistory();
     setBlocks((prev) =>
       prev.map((b) => ({
         ...b,
@@ -251,6 +386,9 @@ export default function App() {
   const handleSingleTranslate = async (id: number, inlineInstruction?: string) => {
     const blockToTranslate = blocks.find((b) => b.id === id);
     if (!blockToTranslate) return;
+
+    // Save history snapshot before starting single re-translation
+    handleForcePushToHistory();
 
     // Set targeted row state to translating
     setBlocks((prev) =>
@@ -308,6 +446,8 @@ export default function App() {
 
   // Merge subtitle blocks (above or under directions)
   const handleMerge = (id: number, direction: "above" | "under") => {
+    // Save history snapshot before merging
+    handleForcePushToHistory();
     const currentIdx = blocks.findIndex((b) => b.id === id);
     if (currentIdx === -1) return;
 
@@ -363,6 +503,8 @@ export default function App() {
     shouldOffset: boolean,
     gapSeconds: number
   ) => {
+    // Save history snapshot before appending
+    handleForcePushToHistory();
     if (blocks.length === 0) {
       setBlocks(incomingBlocks);
       return;
@@ -550,6 +692,28 @@ export default function App() {
                     {translatedCount > 0 ? "Resume" : "Start Translation"}
                   </button>
                 )}
+
+                <button
+                  id="undo-btn"
+                  type="button"
+                  onClick={handleUndo}
+                  disabled={past.length === 0}
+                  className="px-3 py-3 bg-[#1c1c21] border border-[#2a2a2e] hover:bg-[#25252b] text-[#88888e] hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all cursor-pointer rounded-md"
+                  title="Undo (Ctrl+Z)"
+                >
+                  <Undo className="h-4 w-4" />
+                </button>
+
+                <button
+                  id="redo-btn"
+                  type="button"
+                  onClick={handleRedo}
+                  disabled={future.length === 0}
+                  className="px-3 py-3 bg-[#1c1c21] border border-[#2a2a2e] hover:bg-[#25252b] text-[#88888e] hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all cursor-pointer rounded-md"
+                  title="Redo (Ctrl+Y)"
+                >
+                  <Redo className="h-4 w-4" />
+                </button>
 
                 <button
                   id="reset-translate-btn"
