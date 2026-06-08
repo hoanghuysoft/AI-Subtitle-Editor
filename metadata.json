@@ -1,0 +1,6 @@
+{
+  "name": "SRT Subtitle Translator",
+  "description": "Uncensored natural-native subtitle translator using Gemini AI supporting side-by-side bilingual export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
