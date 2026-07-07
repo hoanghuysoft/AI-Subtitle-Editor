@@ -1,12 +1,13 @@
 import { SubtitleBlock } from "../types";
 import { Check, AlertCircle, Loader2, ArrowUp, ArrowDown, Sparkles, X, CornerDownRight } from "lucide-react";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 interface SrtBlockRowProps {
   key?: any;
   block: SubtitleBlock;
   onTextUpdate: (id: number, text: string) => void;
   onSingleTranslate: (id: number, inlineInstruction?: string) => void | Promise<void>;
+  onCancelAndRerun: (id: number) => void | Promise<void>;
   onMergeAbove: (id: number) => void;
   onMergeUnder: (id: number) => void;
   isFirst: boolean;
@@ -17,6 +18,7 @@ export default function SrtBlockRow({
   block, 
   onTextUpdate, 
   onSingleTranslate, 
+  onCancelAndRerun,
   onMergeAbove, 
   onMergeUnder,
   isFirst,
@@ -28,6 +30,22 @@ export default function SrtBlockRow({
 
   const [showContextInput, setShowContextInput] = useState(false);
   const [contextText, setContextText] = useState("");
+  const [secondsElapsed, setSecondsElapsed] = useState(0);
+
+  useEffect(() => {
+    if (!isTranslating) {
+      setSecondsElapsed(0);
+      return;
+    }
+    const startTime = block.translationStartTime || Date.now();
+    setSecondsElapsed(Math.round((Date.now() - startTime) / 1000));
+
+    const interval = setInterval(() => {
+      setSecondsElapsed(Math.round((Date.now() - startTime) / 1000));
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isTranslating, block.translationStartTime]);
 
   const handleTriggerTranslate = async () => {
     if (!contextText.trim()) return;
@@ -89,9 +107,29 @@ export default function SrtBlockRow({
         )}
 
         {isTranslating && (
-          <div className="flex items-center justify-center gap-2 h-[64px] bg-[#c4a67e]/5 border border-[#c4a67e]/20 rounded text-[#c4a67e]">
-            <Loader2 className="h-4 w-4 animate-spin text-[#c4a67e]" />
-            <span className="text-[10px] font-mono tracking-widest uppercase animate-pulse">Processing Block...</span>
+          <div className="flex flex-col gap-2 p-3 bg-[#c4a67e]/5 border border-[#c4a67e]/20 rounded text-[#c4a67e]">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <Loader2 className="h-4 w-4 animate-spin text-[#c4a67e]" />
+                <span className="text-[10px] font-mono tracking-widest uppercase animate-pulse">
+                  Processing Block... {secondsElapsed > 0 ? `(${secondsElapsed}s)` : ""}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => onCancelAndRerun(block.id)}
+                className="text-[9px] uppercase font-mono font-bold tracking-wider px-2 py-0.5 rounded border border-[#c4a67e]/40 hover:bg-[#c4a67e] hover:text-black transition-all cursor-pointer font-sans"
+                title="Cancel active request and restart translation for this block"
+              >
+                Cancel & Rerun
+              </button>
+            </div>
+            {secondsElapsed >= 35 && (
+              <div className="text-[9px] text-[#c4a67e]/80 font-sans italic animate-pulse mt-0.5 flex items-center gap-1">
+                <AlertCircle className="h-3 w-3 inline shrink-0" />
+                <span>Taking longer than 35s. You can click "Cancel & Rerun" to restart.</span>
+              </div>
+            )}
           </div>
         )}
 
@@ -105,10 +143,10 @@ export default function SrtBlockRow({
             <button
               id={`row-retry-btn-${block.id}`}
               type="button"
-              onClick={() => onSingleTranslate(block.id)}
-              className="text-[10px] uppercase font-bold text-rose-300 hover:text-black bg-rose-950 border border-rose-800 hover:bg-rose-400 px-3 py-1 rounded self-start transition-all cursor-pointer font-sans"
+              onClick={() => onCancelAndRerun(block.id)}
+              className="text-[10px] uppercase font-bold text-rose-300 hover:text-black bg-rose-950 border border-rose-800 hover:bg-rose-400 px-3.5 py-1 rounded self-start transition-all cursor-pointer font-sans tracking-wider"
             >
-              Retry block
+              Cancel & Rerun block
             </button>
           </div>
         )}

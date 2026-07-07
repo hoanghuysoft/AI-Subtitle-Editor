@@ -6,6 +6,7 @@ export interface SubtitleBlock {
   translatedText?: string; // Translated text
   status: 'pending' | 'translating' | 'done' | 'failed';
   error?: string;
+  translationStartTime?: number;
 }
 
 export interface ModelChoice {

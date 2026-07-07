@@ -84,8 +84,23 @@ export default function App() {
   // Cancellation reference to pause processing gracefully between batches
   const cancellationRef = useRef<boolean>(false);
 
+  // Active fetch controllers for each block to allow individual cancellation/aborting
+  const activeControllersRef = useRef<Map<number, AbortController>>(new Map());
+
+  // Tracks block IDs which are manually canceled/rerun to differentiate from other batch errors
+  const manuallyCanceledBlockIdsRef = useRef<Set<number>>(new Set());
+
   // Auto scroll table reference
   const tableContainerRef = useRef<HTMLDivElement>(null);
+
+  // Session tracking to prevent infinite retries of failed blocks during the same bulk run
+  const attemptedBlockIdsRef = useRef<Set<number>>(new Set());
+
+  useEffect(() => {
+    if (isTranslating) {
+      attemptedBlockIdsRef.current.clear();
+    }
+  }, [isTranslating]);
 
   useEffect(() => {
     cancellationRef.current = !isTranslating;
@@ -129,7 +144,7 @@ export default function App() {
 
     // Find the next set of pending or failed blocks
     const pendingBlocks = currentBlocks.filter(
-      (b) => b.status === "pending" || b.status === "failed"
+      (b) => (b.status === "pending" || b.status === "failed") && !attemptedBlockIdsRef.current.has(b.id)
     );
 
     if (pendingBlocks.length === 0) {
@@ -143,16 +158,22 @@ export default function App() {
 
     // Update state to 'translating'
     setBlocks((prev) =>
-      prev.map((b) => (batchIds.includes(b.id) ? { ...b, status: "translating", error: undefined } : b))
+      prev.map((b) => (batchIds.includes(b.id) ? { ...b, status: "translating", error: undefined, translationStartTime: Date.now() } : b))
     );
 
+    const controller = new AbortController();
+    batchIds.forEach((id) => {
+      activeControllersRef.current.set(id, controller);
+    });
+
     try {
-      // API call
+      // API call (No standard automatic timeout - let it take as long as it requires)
       const response = await fetch("/api/translate", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
+        signal: controller.signal,
         body: JSON.stringify({
           blocks: batch.map((b) => ({ id: b.id, text: b.text })),
           sourceLanguage,
@@ -163,6 +184,10 @@ export default function App() {
           userGeminiApiKey: userGeminiApiKey || undefined,
           userOpenRouterApiKey: userOpenRouterApiKey || undefined,
         }),
+      });
+
+      batchIds.forEach((id) => {
+        activeControllersRef.current.delete(id);
       });
 
       if (!response.ok) {
@@ -176,11 +201,11 @@ export default function App() {
       // Save state before batch updates
       handleForcePushToHistory();
 
-      // Update blocks with matching translations
+      // Update blocks with matching translations using type-safe loose casting (Number comparison)
       setBlocks((prev) => {
         const updated = prev.map((b) => {
           if (batchIds.includes(b.id)) {
-            const found = translations.find((t) => t.id === b.id);
+            const found = translations.find((t) => Number(t.id) === Number(b.id));
             if (found) {
               return {
                 ...b,
@@ -205,17 +230,56 @@ export default function App() {
       });
 
     } catch (error: any) {
+      batchIds.forEach((id) => {
+        activeControllersRef.current.delete(id);
+      });
+
+      // If user paused translation, abort is expected: exit elegantly
+      if (cancellationRef.current && (error?.name === "AbortError" || error?.message?.includes("aborted"))) {
+        return;
+      }
+
       console.error("Batch error details:", error);
+      const isAbort = error?.name === "AbortError";
+      const finalErrorMsg = error?.message || "Network Error";
       
-      // Mark whole batch as failed
+      // Determine individual fates of blocks in this batch
       setBlocks((prev) => {
-        const updated = prev.map((b) =>
-          batchIds.includes(b.id)
-            ? { ...b, status: "failed" as const, error: error?.message || "Network Timeout" }
-            : b
-        );
-        // Halt translation on massive global backend blockades
-        setIsTranslating(false);
+        const updated = prev.map((b) => {
+          if (batchIds.includes(b.id)) {
+            // If this block is currently being manually cancelled and rerun, ignore it here
+            if (manuallyCanceledBlockIdsRef.current.has(b.id)) {
+              manuallyCanceledBlockIdsRef.current.delete(b.id);
+              return b;
+            }
+
+            // If the batch was aborted because a sister block was cancelled/rerun:
+            // reset inoccent blocks back to "pending" so progress is continued without failures!
+            if (isAbort) {
+              return {
+                ...b,
+                status: "pending" as const,
+                error: undefined,
+              };
+            }
+
+            // Normal failure: Track failed batch ids in this session to prevent infinite batch loops
+            attemptedBlockIdsRef.current.add(b.id);
+            return {
+              ...b,
+              status: "failed" as const,
+              error: finalErrorMsg
+            };
+          }
+          return b;
+        });
+        
+        // Continue translation of other blocks so it won't stop in the middle!
+        if (!cancellationRef.current) {
+          setTimeout(() => translateNextBatch(updated), 200);
+        } else {
+          setIsTranslating(false);
+        }
         return updated;
       });
     }
@@ -233,6 +297,14 @@ export default function App() {
   const handlePause = () => {
     setIsTranslating(false);
     cancellationRef.current = true;
+    activeControllersRef.current.forEach((controller) => {
+      try {
+        controller.abort();
+      } catch (err) {
+        console.error("Error aborting on pause", err);
+      }
+    });
+    activeControllersRef.current.clear();
   };
 
   // Synchronize state values to refs for the keydown handler to prevent stale closures
@@ -392,8 +464,11 @@ export default function App() {
 
     // Set targeted row state to translating
     setBlocks((prev) =>
-      prev.map((b) => (b.id === id ? { ...b, status: "translating", error: undefined } : b))
+      prev.map((b) => (b.id === id ? { ...b, status: "translating", error: undefined, translationStartTime: Date.now() } : b))
     );
+
+    const controller = new AbortController();
+    activeControllersRef.current.set(id, controller);
 
     try {
       const response = await fetch("/api/translate", {
@@ -401,6 +476,7 @@ export default function App() {
         headers: {
           "Content-Type": "application/json",
         },
+        signal: controller.signal,
         body: JSON.stringify({
           blocks: [{ id: blockToTranslate.id, text: blockToTranslate.text }],
           sourceLanguage,
@@ -415,6 +491,8 @@ export default function App() {
         }),
       });
 
+      activeControllersRef.current.delete(id);
+
       if (!response.ok) {
         const errPayload = await response.json().catch(() => ({}));
         throw new Error(errPayload.error || `HTTP ${response.status} failed`);
@@ -422,7 +500,7 @@ export default function App() {
 
       const data = await response.json();
       const translations = data.translations || [];
-      const found = translations.find((t: any) => t.id === id);
+      const found = translations.find((t: any) => Number(t.id) === Number(id));
 
       if (found) {
         setBlocks((prev) =>
@@ -434,14 +512,41 @@ export default function App() {
         throw new Error("Target response was empty.");
       }
     } catch (err: any) {
+      activeControllersRef.current.delete(id);
+
+      // If this block is currently being manually cancelled and rerun, ignore it here
+      if (manuallyCanceledBlockIdsRef.current.has(id)) {
+        return;
+      }
+
+      const isAbort = err?.name === "AbortError";
+      const finalErrorMsg = err?.message || "Connection failed";
+      
       setBlocks((prev) =>
         prev.map((b) =>
           b.id === id
-            ? { ...b, status: "failed", error: err?.message || "Connection failed" }
+            ? { ...b, status: isAbort ? "pending" : "failed", error: isAbort ? undefined : finalErrorMsg }
             : b
         )
       );
     }
+  };
+
+  // Cancel any active translation for a block and rerun its translation immediately
+  const handleCancelAndRerun = async (id: number) => {
+    // 1. Abort any active controller associated with this block
+    const controller = activeControllersRef.current.get(id);
+    if (controller) {
+      manuallyCanceledBlockIdsRef.current.add(id);
+      controller.abort();
+      activeControllersRef.current.delete(id);
+    }
+
+    // 2. Clear from failed attempts list in case it previously was marked as failed
+    attemptedBlockIdsRef.current.delete(id);
+
+    // 3. Fire a single re-translation immediately
+    await handleSingleTranslate(id);
   };
 
   // Merge subtitle blocks (above or under directions)
@@ -927,6 +1032,7 @@ export default function App() {
                       block={block}
                       onTextUpdate={handleBlockTextUpdate}
                       onSingleTranslate={handleSingleTranslate}
+                      onCancelAndRerun={handleCancelAndRerun}
                       onMergeAbove={(id) => handleMerge(id, "above")}
                       onMergeUnder={(id) => handleMerge(id, "under")}
                       isFirst={block.id === 1}

@@ -26,6 +26,74 @@ function getAIClient(): GoogleGenAI {
   return aiClient;
 }
 
+function parseAndNormalizeJSON(content: string): any {
+  let cleanJsonText = content.trim();
+  
+  // 1. Remove markdown block quotes style brackets if present
+  if (cleanJsonText.startsWith("```")) {
+    cleanJsonText = cleanJsonText.replace(/^```json\s*/i, "").replace(/```$/, "").trim();
+  }
+
+  const tryParse = (str: string): any => {
+    try {
+      return JSON.parse(str);
+    } catch {
+      return null;
+    }
+  };
+
+  // Tier 1: Try parsing the direct cleaned string (most correct, preserves internal brackets)
+  let parsed = tryParse(cleanJsonText);
+
+  // Tier 2: Search for the longest curly brace object substring
+  if (!parsed) {
+    const firstBrace = cleanJsonText.indexOf("{");
+    const lastBrace = cleanJsonText.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      const candidate = cleanJsonText.substring(firstBrace, lastBrace + 1);
+      parsed = tryParse(candidate);
+    }
+  }
+
+  // Tier 3: Search for the longest bracket list array substring
+  if (!parsed) {
+    const firstBracket = cleanJsonText.indexOf("[");
+    const lastBracket = cleanJsonText.lastIndexOf("]");
+    if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+      const candidate = cleanJsonText.substring(firstBracket, lastBracket + 1);
+      parsed = tryParse(candidate);
+    }
+  }
+
+  // Tier 4: Attempt dirty repair (stripping trailing commas, etc.)
+  if (!parsed) {
+    // Clean common trailing commas from arrays/objects
+    let repaired = cleanJsonText
+      .replace(/,\s*\]/g, "]")
+      .replace(/,\s*\}/g, "}");
+
+    parsed = tryParse(repaired);
+
+    if (!parsed) {
+      const firstBrace = repaired.indexOf("{");
+      const lastBrace = repaired.lastIndexOf("}");
+      if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+        parsed = tryParse(repaired.substring(firstBrace, lastBrace + 1));
+      }
+    }
+
+    if (!parsed) {
+      const firstBracket = repaired.indexOf("[");
+      const lastBracket = repaired.lastIndexOf("]");
+      if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+        parsed = tryParse(repaired.substring(firstBracket, lastBracket + 1));
+      }
+    }
+  }
+
+  return parsed;
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -82,11 +150,13 @@ CRITICAL REQUIREMENTS:
         const userPrompt = `Translate the following list of subtitle blocks:
 ${JSON.stringify(blocks, null, 2)}
 
-Provide the translations in a valid JSON array of objects conforming to this schema exactly:
-[
-  { "id": 1, "text": "Translated text" }
-]
-Ensure you only output the valid JSON array starting with [ and ending with ]. Do not wrap it in markdown block quotes. Ensure the ID values exactly match the input block IDs.`;
+Provide the translations in a valid JSON object matching the following structure exactly:
+{
+  "translations": [
+    { "id": 1, "text": "Translated text" }
+  ]
+}
+Ensure the root is a valid single JSON object starting with { and ending with }. The IDs must exactly match the input block IDs. Do not omit any elements.`;
 
         const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
@@ -117,30 +187,7 @@ Ensure you only output the valid JSON array starting with [ and ending with ]. D
         if (!content) {
           throw new Error("No response text content returned from OpenRouter API.");
         }
-
-        let cleanJsonText = content.trim();
-        if (cleanJsonText.startsWith("```")) {
-          cleanJsonText = cleanJsonText.replace(/^```json\s*/i, "").replace(/```$/, "").trim();
-        }
-
-        try {
-          const parsed = JSON.parse(cleanJsonText);
-          if (Array.isArray(parsed)) {
-            parsedTranslations = parsed;
-          } else if (parsed && typeof parsed === "object") {
-            const possibleArray = Object.values(parsed).find(Array.isArray);
-            if (possibleArray) {
-              parsedTranslations = possibleArray;
-            } else {
-              throw new Error("JSON structure does not represent an array.");
-            }
-          } else {
-            throw new Error("Parsed JSON content is not standard.");
-          }
-        } catch (e: any) {
-          console.error("OpenRouter Response parsing error:", cleanJsonText);
-          throw new Error(`Failed to parse OpenRouter response: ${e.message}`);
-        }
+        parsedTranslations = parseAndNormalizeJSON(content);
 
       } else {
         const geminiKey = userGeminiApiKey || process.env.GEMINI_API_KEY;
@@ -196,10 +243,45 @@ Provide the translations in a valid JSON array format conforming to the requeste
           throw new Error("No response received from Gemini AI model.");
         }
 
-        parsedTranslations = JSON.parse(text);
+        parsedTranslations = parseAndNormalizeJSON(text);
       }
 
-      res.json({ translations: parsedTranslations });
+      // 1. Resolve and normalize the shape of translation blocks robustly
+      let normalizedList: any[] = [];
+      if (parsedTranslations) {
+        if (Array.isArray(parsedTranslations)) {
+          normalizedList = parsedTranslations;
+        } else if (typeof parsedTranslations === "object") {
+          const possibleArray = Object.values(parsedTranslations).find(Array.isArray);
+          if (possibleArray) {
+            normalizedList = possibleArray;
+          } else if (parsedTranslations.id !== undefined && parsedTranslations.text !== undefined) {
+            normalizedList = [parsedTranslations];
+          } else {
+            console.error("Malformed object parsed:", parsedTranslations);
+            throw new Error("JSON structure did not resolve as a list of translations.");
+          }
+        } else {
+          throw new Error("Decoded content was not a JSON array or object.");
+        }
+      } else {
+        throw new Error("AI responded but translation content was not valid JSON or could not be repaired.");
+      }
+
+      // 2. Strict type check and ID sanitization: convert all types of ID fields (including strings) to native numbers
+      const finalTranslations = normalizedList
+        .map((item: any) => {
+          if (!item || typeof item !== "object") return null;
+          const rawId = item.id !== undefined && item.id !== null ? item.id : null;
+          const rawText = item.text !== undefined && item.text !== null ? String(item.text) : "";
+          if (rawId === null) return null;
+          const parsedId = Number(rawId);
+          if (isNaN(parsedId)) return null;
+          return { id: parsedId, text: rawText };
+        })
+        .filter(Boolean);
+
+      res.json({ translations: finalTranslations });
 
     } catch (error: any) {
       console.error("Translation server error:", error);
